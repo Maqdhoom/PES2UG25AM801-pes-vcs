@@ -12,7 +12,7 @@
 // Note: there is a blank line between the headers and the message.
 //
 // PROVIDED functions: commit_parse, commit_serialize, commit_walk, head_read, head_update
-// TODO functions:     commit_create
+// IMPLEMENTED functions: commit_create
 
 #include "commit.h"
 #include "index.h"
@@ -179,7 +179,7 @@ int head_update(const ObjectID *new_commit) {
     return rename(tmp_path, target_path);
 }
 
-// ─── TODO: Implement these ───────────────────────────────────────────────────
+// ─── IMPLEMENTED: Commit creation functions ───────────────────────────────
 
 // Create a new commit from the current staging area.
 //
@@ -194,8 +194,33 @@ int head_update(const ObjectID *new_commit) {
 //
 // Returns 0 on success, -1 on error.
 int commit_create(const char *message, ObjectID *commit_id_out) {
-    // TODO: Implement commit creation
-    // (See Lab Appendix for logical steps)
-    (void)message; (void)commit_id_out;
-    return -1;
+    ObjectID tree_id;
+    if (tree_from_index(&tree_id) != 0) return -1;
+
+    Commit commit;
+    commit.tree = tree_id;
+    commit.has_parent = 0;
+    if (head_read(&commit.parent) == 0) {
+        commit.has_parent = 1;
+    }
+
+    snprintf(commit.author, sizeof(commit.author), "%s", pes_author());
+    commit.timestamp = (uint64_t)time(NULL);
+    strncpy(commit.message, message, sizeof(commit.message) - 1);
+    commit.message[sizeof(commit.message) - 1] = '\0';
+
+    void *data = NULL;
+    size_t len = 0;
+    if (commit_serialize(&commit, &data, &len) != 0) return -1;
+
+    ObjectID new_commit_id;
+    if (object_write(OBJ_COMMIT, data, len, &new_commit_id) != 0) {
+        free(data);
+        return -1;
+    }
+    free(data);
+
+    if (head_update(&new_commit_id) != 0) return -1;
+    *commit_id_out = new_commit_id;
+    return 0;
 }
