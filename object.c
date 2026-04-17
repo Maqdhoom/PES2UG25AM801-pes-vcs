@@ -15,6 +15,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <errno.h>
 #include <openssl/evp.h>
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
@@ -105,7 +106,7 @@ int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out
     // Build header
     char header[256];
     int header_len = snprintf(header, sizeof(header), "%s %zu", type_str, len);
-    if (header_len < 0 || header_len >= sizeof(header)) return -1;
+    if (header_len < 0 || (size_t)header_len >= sizeof(header)) return -1;
     header[header_len] = '\0'; // Ensure null terminator
     header_len++; // Include the null byte
 
