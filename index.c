@@ -13,9 +13,10 @@
 // what will go into the next commit) and ATOMIC WRITES (temp+rename).
 //
 // PROVIDED functions: index_find, index_remove, index_status
-// TODO functions:     index_load, index_save, index_add
+// IMPLEMENTED functions: index_load, index_save, index_add
 
 #include "index.h"
+#include "tree.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,6 +24,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <inttypes.h>
+
+static int compare_index_entries(const void *a, const void *b) {
+    const IndexEntry *ia = (const IndexEntry *)a;
+    const IndexEntry *ib = (const IndexEntry *)b;
+    return strcmp(ia->path, ib->path);
+}
 
 // ─── PROVIDED ────────────────────────────────────────────────────────────────
 
@@ -49,7 +57,6 @@ int index_remove(Index *index, const char *path) {
         }
     }
     fprintf(stderr, "error: '%s' is not in the index\n", path);
-    return -1;
 }
 
 // Print the status of the working directory.
@@ -125,7 +132,7 @@ int index_status(const Index *index) {
     return 0;
 }
 
-// ─── TODO: Implement these ───────────────────────────────────────────────────
+// ─── IMPLEMENTED: Index staging functions ─────────────────────────────────────
 
 // Load the index from .pes/index.
 //
@@ -135,10 +142,52 @@ int index_status(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_load(Index *index) {
-    // TODO: Implement index loading
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    index->count = 0;
+
+    FILE *f = fopen(INDEX_FILE, "r");
+    if (!f) return 0;
+
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (line[0] == '\n' || line[0] == '\0') continue;
+
+        unsigned int mode;
+        char hash_hex[HASH_HEX_SIZE + 1];
+        unsigned long long mtime_sec;
+        unsigned int size;
+        char path_buf[512];
+
+        int fields = sscanf(line, "%o %64s %llu %u %511[^\\n]",
+                            &mode,
+                            hash_hex,
+                            &mtime_sec,
+                            &size,
+                            path_buf);
+        if (fields != 5) {
+            fclose(f);
+            return -1;
+        }
+
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fclose(f);
+            return -1;
+        }
+
+        IndexEntry *entry = &index->entries[index->count++];
+        entry->mode = mode;
+        entry->mtime_sec = (uint64_t)mtime_sec;
+        entry->size = size;
+        strncpy(entry->path, path_buf, sizeof(entry->path) - 1);
+        entry->path[sizeof(entry->path) - 1] = '\0';
+
+        if (hex_to_hash(hash_hex, &entry->hash) != 0) {
+            fclose(f);
+            return -1;
+        }
+    }
+
+    fclose(f);
+    return 0;
 }
 
 // Save the index to .pes/index atomically.
@@ -152,10 +201,43 @@ int index_load(Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_save(const Index *index) {
-    // TODO: Implement atomic index saving
-    // (See Lab Appendix for logical steps)
-    (void)index;
-    return -1;
+    if (index->count < 0 || index->count > MAX_INDEX_ENTRIES) return -1;
+
+    Index sorted = *index;
+    qsort(sorted.entries, sorted.count, sizeof(IndexEntry), compare_index_entries);
+
+    char tmp_path[512];
+    if (snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", INDEX_FILE) >= (int)sizeof(tmp_path)) return -1;
+
+    FILE *f = fopen(tmp_path, "w");
+    if (!f) return -1;
+
+    char hash_hex[HASH_HEX_SIZE + 1];
+    for (int i = 0; i < sorted.count; i++) {
+        const IndexEntry *entry = &sorted.entries[i];
+        hash_to_hex(&entry->hash, hash_hex);
+        fprintf(f, "%o %s %llu %u %s\n",
+                entry->mode,
+                hash_hex,
+                (unsigned long long)entry->mtime_sec,
+                entry->size,
+                entry->path);
+    }
+
+    fflush(f);
+    if (fsync(fileno(f)) != 0) {
+        fclose(f);
+        unlink(tmp_path);
+        return -1;
+    }
+    fclose(f);
+
+    if (rename(tmp_path, INDEX_FILE) != 0) {
+        unlink(tmp_path);
+        return -1;
+    }
+
+    return 0;
 }
 
 // Stage a file for the next commit.
@@ -168,8 +250,67 @@ int index_save(const Index *index) {
 //
 // Returns 0 on success, -1 on error.
 int index_add(Index *index, const char *path) {
-    // TODO: Implement file staging
-    // (See Lab Appendix for logical steps)
-    (void)index; (void)path;
-    return -1;
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        fprintf(stderr, "error: could not stat '%s'\n", path);
+        return -1;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        fprintf(stderr, "error: '%s' is not a regular file\n", path);
+        return -1;
+    }
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "error: could not open '%s'\n", path);
+        return -1;
+    }
+
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        return -1;
+    }
+    long file_size = ftell(f);
+    if (file_size < 0) {
+        fclose(f);
+        return -1;
+    }
+    rewind(f);
+
+    unsigned char *buffer = malloc((size_t)file_size);
+    if (!buffer) {
+        fclose(f);
+        return -1;
+    }
+    if (file_size > 0 && fread(buffer, 1, (size_t)file_size, f) != (size_t)file_size) {
+        free(buffer);
+        fclose(f);
+        return -1;
+    }
+    fclose(f);
+
+    ObjectID blob_id;
+    if (object_write(OBJ_BLOB, buffer, (size_t)file_size, &blob_id) != 0) {
+        free(buffer);
+        return -1;
+    }
+    free(buffer);
+
+    IndexEntry *entry = index_find(index, path);
+    if (!entry) {
+        if (index->count >= MAX_INDEX_ENTRIES) {
+            fprintf(stderr, "error: index is full\n");
+            return -1;
+        }
+        entry = &index->entries[index->count++];
+    }
+
+    entry->mode = get_file_mode(path);
+    entry->hash = blob_id;
+    entry->mtime_sec = (uint64_t)st.st_mtime;
+    entry->size = (uint32_t)st.st_size;
+    strncpy(entry->path, path, sizeof(entry->path) - 1);
+    entry->path[sizeof(entry->path) - 1] = '\0';
+
+    return index_save(index);
 }
