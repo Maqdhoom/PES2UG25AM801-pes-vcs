@@ -1,7 +1,7 @@
 // tree.c — Tree object serialization and construction
 //
 // PROVIDED functions: get_file_mode, tree_parse, tree_serialize
-// TODO functions:     tree_from_index
+// IMPLEMENTED functions: tree_from_index
 //
 // Binary tree format (per entry, concatenated with no separators):
 //   "<mode-as-ascii-octal> <name>\0<32-byte-binary-hash>"
@@ -10,6 +10,7 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,78 @@
 #define MODE_FILE      0100644
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
+
+static int compare_index_path(const void *a, const void *b) {
+    const IndexEntry *ia = (const IndexEntry *)a;
+    const IndexEntry *ib = (const IndexEntry *)b;
+    return strcmp(ia->path, ib->path);
+}
+
+static const char *tree_path_segment(const char *path, int depth) {
+    const char *p = path;
+    for (int i = 0; i < depth; i++) {
+        p = strchr(p, '/');
+        if (!p) return NULL;
+        p++;
+    }
+    return p;
+}
+
+static int tree_same_segment(const char *path, int depth, const char *name, size_t name_len) {
+    const char *seg = tree_path_segment(path, depth);
+    if (!seg) return 0;
+    return strncmp(seg, name, name_len) == 0 && (seg[name_len] == '/' || seg[name_len] == '\0');
+}
+
+static int write_tree_level(IndexEntry *entries, int count, int depth, ObjectID *id_out) {
+    Tree tree;
+    tree.count = 0;
+
+    int i = 0;
+    while (i < count) {
+        const char *seg = tree_path_segment(entries[i].path, depth);
+        if (!seg) return -1;
+
+        size_t name_len = strcspn(seg, "/");
+        if (name_len == 0 || name_len >= sizeof(tree.entries[0].name)) return -1;
+
+        char name[256];
+        memcpy(name, seg, name_len);
+        name[name_len] = '\0';
+
+        if (seg[name_len] == '\0') {
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+            tree.entries[tree.count].mode = entries[i].mode;
+            tree.entries[tree.count].hash = entries[i].hash;
+            strcpy(tree.entries[tree.count].name, name);
+            tree.count++;
+            i++;
+        } else {
+            int j = i + 1;
+            while (j < count && tree_same_segment(entries[j].path, depth, name, name_len)) {
+                j++;
+            }
+
+            ObjectID subtree_id;
+            if (write_tree_level(&entries[i], j - i, depth + 1, &subtree_id) != 0) return -1;
+            if (tree.count >= MAX_TREE_ENTRIES) return -1;
+
+            tree.entries[tree.count].mode = MODE_DIR;
+            tree.entries[tree.count].hash = subtree_id;
+            strcpy(tree.entries[tree.count].name, name);
+            tree.count++;
+            i = j;
+        }
+    }
+
+    void *data = NULL;
+    size_t len = 0;
+    if (tree_serialize(&tree, &data, &len) != 0) return -1;
+
+    int rc = object_write(OBJ_TREE, data, len, id_out);
+    free(data);
+    return rc;
+}
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
@@ -114,7 +187,7 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
     return 0;
 }
 
-// ─── TODO: Implement these ──────────────────────────────────────────────────
+// ─── IMPLEMENTED: Tree construction functions ──────────────────────────────
 
 // Build a tree hierarchy from the current index and write all tree
 // objects to the object store.
@@ -130,8 +203,10 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //
 // Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index index;
+    if (index_load(&index) != 0) return -1;
+    if (index.count > 0) {
+        qsort(index.entries, index.count, sizeof(IndexEntry), compare_index_path);
+    }
+    return write_tree_level(index.entries, index.count, 0, id_out);
 }
